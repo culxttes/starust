@@ -1,5 +1,4 @@
 use std::fs::read_to_string;
-use std::{borrow::Cow, fmt::Write};
 
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -9,10 +8,7 @@ use reqwest::{
     Client,
     header::{ACCEPT, AUTHORIZATION, HeaderValue, USER_AGENT},
 };
-use serde::{Deserialize, Serialize};
-
-const NB_PAGES: u8 = 10;
-const NB_PER_PAGE: u8 = 100;
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -20,22 +16,20 @@ struct Config {
 }
 
 /// /search/repositories
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct RepoSearchResponse {
     pub items: Vec<RepoSearchResultItem>,
 }
 
 /// "Repo Search Result Item"
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Deserialize)]
 pub struct RepoSearchResultItem {
     pub name: String,
     pub owner: Option<SimpleUser>,
 }
 
 /// "Simple User"
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Deserialize)]
 pub struct SimpleUser {
     pub login: String,
 }
@@ -61,12 +55,58 @@ async fn main() -> anyhow::Result<()> {
         )
         .build()?;
 
-    let mut query: [(&str, Cow<'static, str>); 4] = [
-        ("language", "Rust".into()),
-        ("per_page", NB_PER_PAGE.to_string().into()),
-        ("page", String::new().into()),
-        ("q", "Rust language".into()),
+    const NB_PER_PAGE: u8 = 100;
+
+    let query: [(&str, &str); 3] = [
+        ("language", "Rust"),
+        ("per_page", &NB_PER_PAGE.to_string()),
+        ("q", "Rust language"),
     ];
+
+    let mut search_tasks = FuturesUnordered::new();
+    let mut star_tasks = FuturesUnordered::new();
+
+    println!("Scraping repos...");
+
+    const NB_PAGES: u8 = 10;
+
+    for page in 0..NB_PAGES {
+        let client = client.clone();
+        search_tasks.push(async move {
+            let res: RepoSearchResponse = client
+                .get("https://api.github.com/search/repositories")
+                .query(&query)
+                .query(&[("page", page.to_string())])
+                .send()
+                .await?
+                .json()
+                .await?;
+            Ok::<_, reqwest::Error>(res.items)
+        });
+    }
+
+    while let Some(result) = search_tasks.next().await {
+        match result {
+            Ok(repos) => {
+                for repo in repos {
+                    if let Some(owner) = repo.owner {
+                        let client = client.clone();
+                        let url = format!(
+                            "https://api.github.com/user/starred/{}/{}",
+                            owner.login, repo.name
+                        );
+                        star_tasks.push(async move {
+                            let res = client.put(&url).send().await?;
+                            Ok::<_, reqwest::Error>(res)
+                        });
+                    }
+                }
+            }
+            Err(e) => eprintln!("Search error: {e}"),
+        }
+    }
+
+    println!("Starring repos...");
 
     let nb_star: ProgressBar =
         ProgressBar::new(NB_PAGES as u64 * NB_PER_PAGE as u64).with_style(
@@ -78,38 +118,11 @@ async fn main() -> anyhow::Result<()> {
 
     nb_star.inc(0);
 
-    let mut tasks = FuturesUnordered::new();
-    for page in 0..NB_PAGES {
-        query[2].1.to_mut().clear();
-        write!(&mut query[2].1.to_mut(), "{}", page)?;
-        let res: RepoSearchResponse = client
-            .get("https://api.github.com/search/repositories")
-            .query(&query)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        for repo in res.items {
-            if let Some(owner) = repo.owner {
-                let url = format!(
-                    "https://api.github.com/user/starred/{}/{}",
-                    owner.login, repo.name
-                );
-                let client = client.clone();
-                tasks.push(async move {
-                    let res = client.put(&url).send().await?;
-                    Ok::<_, reqwest::Error>(res)
-                });
-            }
-        }
-
-        while let Some(res) = tasks.next().await {
-            match res {
-                Ok(r) if r.status() == StatusCode::NO_CONTENT => nb_star.inc(1),
-                Ok(r) => eprintln!("{}", r.text().await.unwrap_or_default()),
-                Err(e) => eprintln!("Error: {e}"),
-            }
+    while let Some(res) = star_tasks.next().await {
+        match res {
+            Ok(r) if r.status() == StatusCode::NO_CONTENT => nb_star.inc(1),
+            Ok(r) => eprintln!("{}", r.text().await?),
+            Err(e) => eprintln!("Star error: {e}"),
         }
     }
 
